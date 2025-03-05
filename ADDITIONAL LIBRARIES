@@ -1,0 +1,7 @@
+pip install PyQt5
+
+pip install deepgram
+
+pip install python-dotenv
+
+pip install openai
