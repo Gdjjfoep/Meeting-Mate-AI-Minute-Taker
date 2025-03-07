@@ -1,12 +1,10 @@
-#summarize and export button issue 
-
+# its perfect
 
 import sys
 import asyncio
 from PyQt5 import QtWidgets, QtGui
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QUrl
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtWebEngineWidgets import QWebEnginePage, QWebEngineSettings
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineSettings
 from deepgram import (
     DeepgramClient,
     DeepgramClientOptions,
@@ -16,13 +14,23 @@ from deepgram import (
 )
 from dotenv import load_dotenv
 from PyQt5.QtWidgets import QFileDialog
-import openai  # Import OpenAI API client
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
+from sumy.summarizers.text_rank import TextRankSummarizer
+import nltk
+import os
+
+# Set the NLTK data path explicitly
+nltk_data_path = os.path.join(os.path.expanduser("~"), "nltk_data")
+nltk.data.path.append(nltk_data_path)
+
+# Download required NLTK data
+nltk.download('punkt', download_dir=nltk_data_path)
+nltk.download('punkt_tab', download_dir=nltk_data_path)
 
 # Load environment variables (like API key)
 load_dotenv()
-
-# Set your OpenAI API key here
-openai.api_key = 'YOUR_OPENAI_API_KEY'
 
 # Transcript Collector
 class TranscriptCollector:
@@ -47,41 +55,38 @@ class TranscriptionThread(QThread):
 
     def __init__(self):
         super().__init__()
-        self.is_running = False  # Change to ensure it's started properly
-        self._stop = False  # Add an explicit flag to control stopping
+        self.is_running = False
+        self._stop = False
+        self.dg_connection = None
+        self.microphone = None
+        self.loop = None  # Event loop reference
 
     def run(self):
-        asyncio.run(self.get_transcript())
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self.get_transcript())
 
     async def get_transcript(self):
         try:
-            # Create Deepgram client
             config = DeepgramClientOptions(options={"keepalive": "true"})
-            deepgram = DeepgramClient("API_KEY", config)
-            dg_connection = deepgram.listen.asyncwebsocket.v("1")
+            deepgram = DeepgramClient("b12553e7fd323f9b22230f7949d987f7c0aca055", config)
+            self.dg_connection = deepgram.listen.asyncwebsocket.v("1")
 
-            # Modified on_message handler
             async def on_message(*args, **kwargs):
                 result = kwargs.get("result", None)
                 if result and hasattr(result, 'channel') and hasattr(result.channel, 'alternatives'):
                     sentence = result.channel.alternatives[0].transcript
-                    if not result.speech_final:
+                    if sentence.strip():  # Only add non-empty sentences
                         transcript_collector.add_part(sentence)
-                    else:
-                        transcript_collector.add_part(sentence)
-                        full_sentence = transcript_collector.get_full_transcript()
-                        self.transcript_updated.emit(full_sentence)  # Emit the updated transcript
-                        transcript_collector.reset()
+                        self.transcript_updated.emit(sentence)  # Emit only the new sentence
 
-            # Modified on_error handler
             async def on_error(*args, **kwargs):
                 error = kwargs.get("error", None)
                 if error:
                     print(f"\n\n{error}\n\n")
 
-            # Set up Deepgram connection
-            dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
-            dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+            self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
+            self.dg_connection.on(LiveTranscriptionEvents.Error, on_error)
 
             options = LiveOptions(
                 model="nova-3",
@@ -93,45 +98,51 @@ class TranscriptionThread(QThread):
                 endpointing=True,
             )
 
-            # Start transcription
-            await dg_connection.start(options)
+            await self.dg_connection.start(options)
 
-            # Open microphone stream
-            microphone = Microphone(dg_connection.send)
-            microphone.start()
+            self.microphone = Microphone(self.dg_connection.send)
+            self.microphone.start()
 
-            while self.is_running and not self._stop:  # Control flow with both flags
-                if not microphone.is_active():
+            while self.is_running and not self._stop:
+                if not self.microphone.is_active():
                     break
                 await asyncio.sleep(1)
 
-            # Finish after transcription ends
-            microphone.finish()
-            await dg_connection.finish()
+            self.microphone.finish()
+            await self.dg_connection.finish()
 
+        except asyncio.CancelledError:
+            print("Transcription task cancelled.")
         except Exception as e:
             print(f"Could not open socket: {e}")
 
     def stop(self):
         self._stop = True
         self.is_running = False
+        if self.microphone:
+            self.microphone.finish()
+        if self.dg_connection:
+            # We no longer use asyncio.run, we schedule finish to the current event loop
+            if self.loop:
+                self.loop.create_task(self.dg_connection.finish())
 
     def start_transcription(self):
         self.is_running = True
-        self._stop = False  # Reset stop flag
-        self.start()  # Restart the transcription thread
+        self._stop = False
+        self.start()
 
-# Summary Functionality using OpenAI
-def summarize_text(text):
+# Summary Functionality using Sumy
+def summarize_with_sumy(text, sentences_count=3, method="lsa"):
     try:
-        # Use OpenAI API to summarize the transcript
-        response = openai.Completion.create(
-            engine="gpt-3.5-turbo",  # Or "gpt-4" for the more advanced version
-            prompt=f"Please summarize the following meeting transcript, highlighting the key points, action items, decisions made, and any important follow-ups. Be sure to include a brief overview of the main topics discussed and the key takeaways from the conversation.:\n\n{text}",
-            max_tokens=200,  # You can adjust this to control the summary length
-            temperature=0.5,  # Control the creativity/variability of the summary
-        )
-        return response.choices[0].text.strip()  # Get the summarized text
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        if method == "lsa":
+            summarizer = LsaSummarizer()
+        elif method == "text_rank":
+            summarizer = TextRankSummarizer()
+        else:
+            raise ValueError("Invalid method. Choose 'lsa' or 'text_rank'.")
+        summary = summarizer(parser.document, sentences_count)
+        return " ".join(str(sentence) for sentence in summary)
     except Exception as e:
         print(f"Error while summarizing: {e}")
         return "Sorry, summarization failed."
@@ -145,8 +156,7 @@ class MeetingMateUI(QtWidgets.QWidget):
         self.setStyleSheet("background-color: #A5BFCC;")
         self.initUI()
 
-        self.transcription_thread = TranscriptionThread()  # Create transcription thread
-        self.transcription_thread.transcript_updated.connect(self.update_highlight_area)
+        self.transcription_thread = None  # Initialize as None
 
     def initUI(self):
         main_layout = QtWidgets.QHBoxLayout(self)
@@ -190,8 +200,8 @@ class MeetingMateUI(QtWidgets.QWidget):
         # Meeting Screen Section (with URL input box)
         meeting_screen_label = self.create_section_label("Meeting Screen")
         self.jitsi_view = QWebEngineView()
-        self.jitsi_view.setStyleSheet("border: 2px solid black;")  # Styling
-        self.jitsi_view.setUrl(QUrl("about:blank"))  # Blank initially
+        self.jitsi_view.setStyleSheet("border: 2px solid black;")
+        self.jitsi_view.setUrl(QUrl("about:blank"))
 
         url_input_layout = QtWidgets.QHBoxLayout()
         self.url_input = QtWidgets.QLineEdit()
@@ -201,7 +211,6 @@ class MeetingMateUI(QtWidgets.QWidget):
         url_input_layout.addWidget(self.url_input)
         url_input_layout.addWidget(self.join_button)
 
-        # Add to layout
         center_panel.addWidget(meeting_screen_label)
         center_panel.addLayout(url_input_layout)
         center_panel.addWidget(self.jitsi_view)
@@ -209,7 +218,7 @@ class MeetingMateUI(QtWidgets.QWidget):
         # Right Panel (Highlights)
         right_panel = QtWidgets.QVBoxLayout()
         highlights_label = self.create_section_label("Conversation")
-        self.highlights_area = self.create_text_area()  # This is the highlight area
+        self.highlights_area = self.create_text_area()
         right_panel.addWidget(highlights_label)
         right_panel.addWidget(self.highlights_area)
 
@@ -228,7 +237,7 @@ class MeetingMateUI(QtWidgets.QWidget):
     def create_section_label(self, text):
         label = QtWidgets.QLabel(text)
         label.setFont(QtGui.QFont("Arial", 12, QtGui.QFont.Bold))
-        label.setFixedHeight(40)  # Set the height to match other labels (example height)
+        label.setFixedHeight(40)
         label.setStyleSheet("background-color: #FFFFFF; border: 1px solid #B0B0B0; padding: 5px;")
         return label
 
@@ -239,78 +248,79 @@ class MeetingMateUI(QtWidgets.QWidget):
         return text_area
 
     def start_transcription(self):
-        self.highlights_area.append("Transcription Started...\n")  # Show in Highlights
-        self.transcription_thread.start_transcription()  # Start the transcription thread
+        if self.transcription_thread and self.transcription_thread.isRunning():
+            return  # Avoid starting multiple threads
+
+        self.highlights_area.append("Transcription Started...\n")
+        transcript_collector.reset()  # Reset transcript collector for a new session
+
+        # Create a new thread instance
+        self.transcription_thread = TranscriptionThread()
+        self.transcription_thread.transcript_updated.connect(self.update_highlight_area)
+        self.transcription_thread.start_transcription()
 
     def stop_transcription(self):
-        self.highlights_area.append("Transcription Stopped...\n")  # Show in Highlights
-        self.transcription_thread.stop()  # Stop the transcription thread
+        if self.transcription_thread:
+            self.highlights_area.append("Transcription Stopped...\n")
+            self.transcription_thread.stop()
+            self.transcription_thread.quit()  # Ensure the thread is properly terminated
+            self.transcription_thread.wait()  # Wait for the thread to finish
+            self.transcription_thread = None  # Reset the thread object
 
     def summarize_meeting(self):
-        # Get the full transcript
         transcript = transcript_collector.get_full_transcript()
+        print(f"Transcript for summarization: {transcript}")
         
-        if not transcript:
-            self.highlights_area.append("No transcript available to summarize.\n")  # Show in Highlights
+        if not transcript.strip():
+            self.highlights_area.append("No transcript available to summarize.\n")
             return
         
-        # Generate summary of the current transcript
-        summary = summarize_text(transcript)
-        
-        # Update the summary area with the latest summary
-        self.summary_area.setText(summary)  # Set the summary in the summary area
-        self.highlights_area.append(f"Summary updated:\n{summary}\n")  # Show in Highlights
+        summary = summarize_with_sumy(transcript, sentences_count=3, method="lsa")
+        self.summary_area.setText(summary)
+        self.highlights_area.append(f"Summary updated:\n{summary}\n")
 
     def export_transcript(self):
-        # Export transcript to a file
         transcript = transcript_collector.get_full_transcript()
-        if not transcript:
-            self.highlights_area.append("No transcript to export.\n")  # Show in Highlights
+        print(f"Transcript for export: {transcript}")
+        
+        if not transcript.strip():
+            self.highlights_area.append("No transcript to export.\n")
             return
 
-        # Show file save dialog
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Transcript", "", "Text Files (*.txt);;All Files (*)")
         if file_path:
             with open(file_path, "w") as file:
                 file.write(transcript)
-            self.highlights_area.append(f"Transcript exported to {file_path}\n")  # Show in Highlights
+            self.highlights_area.append(f"Transcript exported to {file_path}\n")
 
     def join_meeting(self):
         url = self.url_input.text().strip()
         if url:
             self.jitsi_view.setUrl(QUrl(url))
-            self.highlights_area.append("Joining meeting...\n")  # Show in Highlights
+            self.highlights_area.append("Joining meeting...\n")
 
-            # Grant permissions for microphone and camera
             def grant_permissions():
                 self.jitsi_view.page().setFeaturePermission(
-                    QUrl(url),  # The URL to grant permissions for
+                    QUrl(url),
                     QWebEnginePage.MediaAudioCapture,
                     QWebEnginePage.PermissionGrantedByUser
                 )
                 self.jitsi_view.page().setFeaturePermission(
-                    QUrl(url),  # The URL to grant permissions for
+                    QUrl(url),
                     QWebEnginePage.MediaVideoCapture,
                     QWebEnginePage.PermissionGrantedByUser
                 )
 
-            # Wait for the page to load before granting permissions
             self.jitsi_view.loadFinished.connect(grant_permissions)
-
-            # Enable WebRTC
             self.jitsi_view.settings().setAttribute(QWebEngineSettings.WebRTCPublicInterfacesOnly, False)
         else:
-            self.highlights_area.append("Please enter a valid meeting URL.\n")  # Show in Highlights
+            self.highlights_area.append("Please enter a valid meeting URL.\n")
 
-    # Method to update the highlights area with the new transcription text
     def update_highlight_area(self, transcript):
-        self.highlights_area.append(f"Speaker: {transcript}\n")
+        self.highlights_area.append(f"Speaker: {transcript}\n")  # Append only the new sentence
 
-# Run the UI
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     ui = MeetingMateUI()
     ui.show()
     sys.exit(app.exec_())
-
-
