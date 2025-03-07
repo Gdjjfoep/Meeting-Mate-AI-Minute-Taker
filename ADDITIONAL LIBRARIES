@@ -6,4 +6,8 @@ pip install python-dotenv
 
 pip install openai
 
+pip install sumy
+
+pip install nltk
+
 VB cable as default(recording and playback tab)
