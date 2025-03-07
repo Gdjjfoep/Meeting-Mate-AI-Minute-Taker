@@ -5,3 +5,5 @@ pip install deepgram
 pip install python-dotenv
 
 pip install openai
+
+VB cable as default(recording and playback tab)
